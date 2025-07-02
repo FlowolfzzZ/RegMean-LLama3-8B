@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from transformers import default_data_collator, DataCollatorWithPadding
 import argparse
 
-def tokenize_function_code(example, tokenizer):
+def tokenize_function(example, tokenizer):
     input = tokenizer.apply_chat_template([
         {'role':'system', 'content': example['instruction']},
         {'role':'user', 'content': example['input']},
@@ -23,20 +23,6 @@ def tokenize_function_code(example, tokenizer):
         max_length=256,
         padding=True,
         padding_side='left'
-    )
-
-def tokenize_function_math(example, tokenizer):
-    input = tokenizer.apply_chat_template([
-        {'role':'user', 'content': example['question']},
-        {'role':'assistant', 'content': example['answer']}
-    ], tokenize=False)
-    return tokenizer(
-        input,
-        truncation=True,
-        max_length=256,
-        padding=True,
-        padding_side='left'
-        
     )
 
 def filter_params_to_merge(param_names, exclude_param_regex):
@@ -68,7 +54,6 @@ def compute_gram(model, train_dataloader, n_step, handles):
             x = x.view(-1, x.size(-1))
             xtx = torch.matmul(x.transpose(0,1), x) # [h,h]
 
-            
             if name not in grams:
                 raw_val = xtx / x.size(0)
                 grams[name] = raw_val.cpu()
@@ -117,33 +102,20 @@ def load_grams(root):
         obj = pickle.load(f)
     return obj
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('setup')
-    args = parser.parse_args()
-
-    if args.setup == 'code':
-        dataset_name = 'Replete-AI/code_bagel_hermes-2.5'
-        model_name = 'rombodawg/rombos_Replete-Coder-Llama3-8B'
-        output_dir = 'runs/merges/code-llama3'
-        tokenize_func = tokenize_function_code
-    elif args.setup == 'math':
-        dataset_name = 'TIGER-Lab/WebInstructSub'
-        model_name = 'TIGER-Lab/MAmmoTH2-8B'
-        tokenize_func = tokenize_function_math
-        output_dir = 'runs/merges/math-llama3'
-    else:
-        raise NotImplementedError
-    
-
+def main(
+    model_name: str,
+    dataset_name: str,
+    output_dir: str,
+):
     os.makedirs(output_dir, exist_ok=True)
 
-    train_ds = load_dataset(dataset_name, split='train[:10000]')
+    # train_ds = load_dataset(dataset_name, split='train[:10000]')
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+    # quant_config = BitsAndBytesConfig(load_in_8bit=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-    tokenized_ds = train_ds.map(tokenize_func, fn_kwargs={'tokenizer': tokenizer})
+    
+    train_ds = load_dataset("json", data_files=dataset_name, split='train[:2000]')
+    tokenized_ds = train_ds.map(tokenize_function, fn_kwargs={'tokenizer': tokenizer})
     tokenized_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
     collator = DataCollatorWithPadding(tokenizer)
@@ -154,4 +126,8 @@ if __name__ == '__main__':
         grams = compute_gram(model, train_loader,  -1, handles)
 
     with open(os.path.join(output_dir, 'gram.pkl'),'wb') as wf:
-        pickle.dump(grams, wf)  
+        pickle.dump(grams, wf)
+
+if __name__ == '__main__':
+    import fire
+    fire.Fire(main)
