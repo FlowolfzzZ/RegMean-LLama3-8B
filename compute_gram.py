@@ -9,7 +9,7 @@ import pickle
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import default_data_collator, DataCollatorWithPadding
-import argparse
+from torch.utils.data.distributed import DistributedSampler
 
 def tokenize_function(example, tokenizer):
     input = tokenizer.apply_chat_template([
@@ -67,9 +67,9 @@ def compute_gram(model, train_dataloader, n_step, handles):
 
     linear_modules = filter_modules_by_regex(model, None, [nn.Linear])
 
-    print('Identified linear layers')
-    for k in linear_modules:
-        print(k)
+    # print('Identified linear layers')
+    # for k in linear_modules:
+    #     print(k)
     
     for name, module in linear_modules.items():
         handle = module.register_forward_hook(get_gram(name))
@@ -107,26 +107,48 @@ def main(
     dataset_name: str,
     output_dir: str,
 ):
+    torch.distributed.init_process_group('nccl', init_method='env://')
+    rank = int(os.environ.get("RANK", -1))
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", -1))
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda")
+    print(f"[RANK {rank} | LOCAL_RANK {local_rank}] Using CUDA device {torch.cuda.current_device()}: {torch.cuda.get_device_name(torch.cuda.current_device())} | World size: {world_size}")
+                                         
     os.makedirs(output_dir, exist_ok=True)
 
     # train_ds = load_dataset(dataset_name, split='train[:10000]')
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     # quant_config = BitsAndBytesConfig(load_in_8bit=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=None)
     
     train_ds = load_dataset("json", data_files=dataset_name, split='train[:2000]')
     tokenized_ds = train_ds.map(tokenize_function, fn_kwargs={'tokenizer': tokenizer})
     tokenized_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
+    train_sampler = DistributedSampler(tokenized_ds)
     collator = DataCollatorWithPadding(tokenizer)
-    train_loader = DataLoader(tokenized_ds, batch_size=32, collate_fn=collator)
+    train_loader = torch.utils.data.DataLoader(
+        tokenized_ds,
+        batch_size=32,
+        sampler=train_sampler,
+        collate_fn=collator
+    )
 
     handles = []
     with torch.no_grad():
         grams = compute_gram(model, train_loader,  -1, handles)
 
-    with open(os.path.join(output_dir, 'gram.pkl'),'wb') as wf:
-        pickle.dump(grams, wf)
+    def is_main_process():
+        # 分布式初始化后才有效；否则默认返回 True
+        import torch.distributed as dist
+        return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+    
+    if is_main_process():
+        with open(os.path.join(output_dir, 'gram.pkl'),'wb') as wf:
+            pickle.dump(grams, wf)
 
 if __name__ == '__main__':
     import fire
